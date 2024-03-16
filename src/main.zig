@@ -3,6 +3,8 @@ const std = @import("std");
 const ChanError = error{
     Closed,
     OutOfMemory,
+    NotImplemented,
+    DataCorruption,
 };
 
 fn Chan(comptime T: type) type {
@@ -17,19 +19,57 @@ fn BufferedChan(comptime T: type, comptime bufSize: u8) type {
     return struct {
         const Self = @This();
         const bufType = [bufSize]?*T; // buffer
-
-        alloc: std.mem.Allocator = undefined,
         buf: bufType = [_]?*T{null} ** bufSize,
         closed: bool = false,
+        mut: std.Thread.Mutex = std.Thread.Mutex{},
+        alloc: std.mem.Allocator = undefined,
+        recvQ: std.ArrayList(Receiver) = undefined,
+        sendQ: std.ArrayList(Receiver) = undefined,
 
-        // sync utils
-        recvLock: std.Thread.Mutex = std.Thread.Mutex{},
-        resvReady: bool = false,
-        sendLock: std.Thread.Mutex = std.Thread.Mutex{},
-        escrow: ?*T = null, // single item buffer used only for handoff between known sender and receiver
+        // represents a thread waiting on recv
+        const Receiver: type = struct {
+            mut: std.Thread.Mutex = std.Thread.Mutex{},
+            condition: std.Thread.Condition = std.Thread.Condition{},
+            data: ?T = null,
+
+            fn putDataAndSignal(self: @This(), data: T) void {
+                // invoked by sender thread
+                self.data = data;
+                self.c.signal();
+            }
+        };
+
+        // represents a thread waiting on send
+        const Sender: type = struct {
+            mut: std.Thread.Mutex = std.Thread.Mutex{},
+            condition: std.Thread.Condition = std.Thread.Condition{},
+            data: T,
+
+            fn getDataAndSignal(self: @This()) T {
+                defer self.c.signal();
+                return self.data;
+            }
+        };
+
+        // new impl
+        // sender queue
+        // receiver queue, containing empty buffer for T
+
+        // cases
+        // - no queue
+        // sender arrives first, ends up waiting on queue. receiver signals it once it's taken value
+        // receiver arrives first, ends up waiting on queue. sender signals it once it's taken value (note senders and receivers both need methods to receive)
+
+        // todo: make sender obj and receiver obj, each with
+        // - unique condition signal (maybe could share some mutex?)
+        // - data transfer methods
 
         fn init(alloc: std.mem.Allocator) Self {
-            return Self{ .alloc = alloc };
+            return Self{
+                .alloc = alloc,
+                .recvQ = std.ArrayList(Receiver).init(alloc),
+                .sendQ = std.ArrayList(Receiver).init(alloc),
+            };
         }
 
         fn len(self: *Self) u8 {
@@ -50,25 +90,39 @@ fn BufferedChan(comptime T: type, comptime bufSize: u8) type {
 
         fn send(self: *Self, data: T) ChanError!void {
             if (self.closed) return ChanError.Closed;
-            // acquire send lock (other threads may be contesting for this)
-            self.sendLock.lock();
-            defer self.sendLock.unlock();
-            var item = self.alloc.create(T) catch {
-                return ChanError.OutOfMemory;
-            };
-            item.* = data;
 
-            // await listening receiver (assumes no buffer)
-            while (true) : (std.time.sleep(1_000)) {
-                if (self.resvReady) {
-                    self.escrow = item;
-                    // await confirmation that escrow is pulled (it'd become null)
-                    while (self.escrow) |_| {
-                        std.time.sleep(1_000);
-                    }
-                    return;
-                }
+            self.mut.lock();
+            errdefer self.mut.unlock();
+
+            // case: receiver already waiting
+            // pull receiver (if any) and give it data. Signal receiver that it's done waiting.
+            if (self.recvQ.items.len > 0) {
+                defer self.mut.unlock();
+                var receiver: Receiver = self.recvQ.orderedRemove(0);
+                receiver.putDataAndSignal(data);
+                return;
             }
+
+            if (self.len() < self.capacity()) {
+                defer self.mut.unlock();
+                // put T on chan buffer
+                // TODO
+                return;
+            }
+
+            // hold on sender queue. Receivers will signal when they take data.
+            var sender: Sender = Sender{ .data = data };
+
+            // prime condition
+            sender.mut.lock(); // cond.wait below will unlock it and wait until signal, then relock it
+            defer sender.mut.unlock(); // unlocks the relock
+
+            try self.sendQ.append(sender); // make visible to other threads
+            self.mut.unlock(); // allow all other threads to proceed. This thread is done reading/writing
+
+            // now just wait for receiver to signal sender
+            sender.cond.wait(&sender.mut);
+            return;
         }
 
         fn close(self: *Self) void {
@@ -77,25 +131,42 @@ fn BufferedChan(comptime T: type, comptime bufSize: u8) type {
 
         fn recv(self: *Self) ChanError!T {
             if (self.closed) return ChanError.Closed;
-            self.recvLock.lock();
 
-            // signal ready for recv, allowing sender to put item in escrow
-            self.resvReady = true;
-            // await item in escrow
-            while (true) {
-                if (self.escrow) |item| {
-                    // destroy heap allocation and copy value to stack for return
-                    defer self.alloc.destroy(item);
-                    const copy = item.*;
+            self.mut.lock();
+            errdefer self.mut.unlock();
 
-                    // sender will unlock its mutex once we clear escrow so do that last
-                    self.resvReady = false;
-                    self.recvLock.unlock();
-                    self.escrow = null;
+            // case: value in buffer
+            if (self.len() > 0) {
+                // TODO
+                return ChanError.NotImplemented;
+            }
 
-                    return copy;
-                }
-                std.time.sleep(1_000);
+            // case: sender already waiting
+            // pull sender and take its data. Signal sender that it's done waiting.
+            if (self.sendQ.items.len > 0) {
+                defer self.mut.unlock();
+                var sender: Sender = self.sendQ.orderedRemove(0);
+                const data: T = sender.getDataAndSignal();
+                return data;
+            }
+
+            // hold on receiver queue. Senders will signal when they take it.
+            var receiver: Receiver = Receiver{};
+
+            // prime condition
+            receiver.mut.lock();
+            defer receiver.mut.unlock();
+
+            try self.recvQ.append(receiver);
+            self.mut.unlock();
+
+            // now wait for sender to signal receiver
+            receiver.cond.wait(&receiver.mut);
+            // sender should have put data in .data
+            if (receiver.data) |data| {
+                return data;
+            } else {
+                return ChanError.DataCorruption;
             }
         }
     };
