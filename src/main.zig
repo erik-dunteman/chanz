@@ -30,9 +30,8 @@ fn BufferedChan(comptime T: type, comptime bufSize: u8) type {
             data: ?T = null,
 
             fn putDataAndSignal(self: *@This(), data: T) void {
-                // invoked by sender thread
+                defer self.cond.signal();
                 self.data = data;
-                self.cond.signal();
             }
         };
 
@@ -43,7 +42,7 @@ fn BufferedChan(comptime T: type, comptime bufSize: u8) type {
             data: T,
 
             fn getDataAndSignal(self: *@This()) T {
-                self.cond.signal();
+                defer self.cond.signal();
                 return self.data;
             }
         };
@@ -96,6 +95,7 @@ fn BufferedChan(comptime T: type, comptime bufSize: u8) type {
                 return;
             }
 
+            // case: room in buffer
             if (self.len() < self.capacity()) {
                 defer self.mut.unlock();
                 // put T on chan buffer
