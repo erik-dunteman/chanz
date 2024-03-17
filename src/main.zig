@@ -11,9 +11,37 @@ fn Chan(comptime T: type) type {
     return BufferedChan(T, 0);
 }
 
-// naive implementation
-// sending polls until there's room in buffer, or a receiver listening
-// receivers poll for buffer item, or if there's no receiver in chan, then they register themselves as receiver
+// represents a thread waiting on recv
+fn Receiver(comptime T: type) type {
+    return struct {
+        const Self = @This();
+        mut: std.Thread.Mutex = std.Thread.Mutex{},
+        cond: std.Thread.Condition = std.Thread.Condition{},
+        data: ?T = null,
+
+        fn putDataAndSignal(self: *Self, data: T) void {
+            // invoked by sender thread
+            self.data = data;
+            self.cond.signal();
+        }
+    };
+}
+
+// represents a thread waiting on send
+fn Sender(comptime T: type) type {
+    return struct {
+        const Self = @This();
+        mut: std.Thread.Mutex = std.Thread.Mutex{},
+        cond: std.Thread.Condition = std.Thread.Condition{},
+        data: T,
+
+        fn getDataAndSignal(self: *Self) T {
+            self.cond.signal();
+            return self.data;
+        }
+    };
+}
+
 // note: use of buffer not yet implemented
 fn BufferedChan(comptime T: type, comptime bufSize: u8) type {
     return struct {
@@ -23,53 +51,20 @@ fn BufferedChan(comptime T: type, comptime bufSize: u8) type {
         closed: bool = false,
         mut: std.Thread.Mutex = std.Thread.Mutex{},
         alloc: std.mem.Allocator = undefined,
-        recvQ: std.ArrayList(Receiver) = undefined,
-        sendQ: std.ArrayList(Receiver) = undefined,
-
-        // represents a thread waiting on recv
-        const Receiver: type = struct {
-            mut: std.Thread.Mutex = std.Thread.Mutex{},
-            condition: std.Thread.Condition = std.Thread.Condition{},
-            data: ?T = null,
-
-            fn putDataAndSignal(self: @This(), data: T) void {
-                // invoked by sender thread
-                self.data = data;
-                self.c.signal();
-            }
-        };
-
-        // represents a thread waiting on send
-        const Sender: type = struct {
-            mut: std.Thread.Mutex = std.Thread.Mutex{},
-            condition: std.Thread.Condition = std.Thread.Condition{},
-            data: T,
-
-            fn getDataAndSignal(self: @This()) T {
-                defer self.c.signal();
-                return self.data;
-            }
-        };
-
-        // new impl
-        // sender queue
-        // receiver queue, containing empty buffer for T
-
-        // cases
-        // - no queue
-        // sender arrives first, ends up waiting on queue. receiver signals it once it's taken value
-        // receiver arrives first, ends up waiting on queue. sender signals it once it's taken value (note senders and receivers both need methods to receive)
-
-        // todo: make sender obj and receiver obj, each with
-        // - unique condition signal (maybe could share some mutex?)
-        // - data transfer methods
+        recvQ: std.ArrayList(*Receiver(T)) = undefined,
+        sendQ: std.ArrayList(*Sender(T)) = undefined,
 
         fn init(alloc: std.mem.Allocator) Self {
             return Self{
                 .alloc = alloc,
-                .recvQ = std.ArrayList(Receiver).init(alloc),
-                .sendQ = std.ArrayList(Receiver).init(alloc),
+                .recvQ = std.ArrayList(*Receiver(T)).init(alloc),
+                .sendQ = std.ArrayList(*Sender(T)).init(alloc),
             };
+        }
+
+        fn deinit(self: *Self) void {
+            self.recvQ.deinit();
+            self.sendQ.deinit();
         }
 
         fn len(self: *Self) u8 {
@@ -98,7 +93,7 @@ fn BufferedChan(comptime T: type, comptime bufSize: u8) type {
             // pull receiver (if any) and give it data. Signal receiver that it's done waiting.
             if (self.recvQ.items.len > 0) {
                 defer self.mut.unlock();
-                var receiver: Receiver = self.recvQ.orderedRemove(0);
+                var receiver: *Receiver(T) = self.recvQ.orderedRemove(0);
                 receiver.putDataAndSignal(data);
                 return;
             }
@@ -111,13 +106,13 @@ fn BufferedChan(comptime T: type, comptime bufSize: u8) type {
             }
 
             // hold on sender queue. Receivers will signal when they take data.
-            var sender: Sender = Sender{ .data = data };
+            var sender = Sender(T){ .data = data };
 
             // prime condition
             sender.mut.lock(); // cond.wait below will unlock it and wait until signal, then relock it
             defer sender.mut.unlock(); // unlocks the relock
 
-            try self.sendQ.append(sender); // make visible to other threads
+            try self.sendQ.append(&sender); // make visible to other threads
             self.mut.unlock(); // allow all other threads to proceed. This thread is done reading/writing
 
             // now just wait for receiver to signal sender
@@ -145,19 +140,19 @@ fn BufferedChan(comptime T: type, comptime bufSize: u8) type {
             // pull sender and take its data. Signal sender that it's done waiting.
             if (self.sendQ.items.len > 0) {
                 defer self.mut.unlock();
-                var sender: Sender = self.sendQ.orderedRemove(0);
+                var sender: *Sender(T) = self.sendQ.orderedRemove(0);
                 const data: T = sender.getDataAndSignal();
                 return data;
             }
 
             // hold on receiver queue. Senders will signal when they take it.
-            var receiver: Receiver = Receiver{};
+            var receiver = Receiver(T){};
 
             // prime condition
             receiver.mut.lock();
             defer receiver.mut.unlock();
 
-            try self.recvQ.append(receiver);
+            try self.recvQ.append(&receiver);
             self.mut.unlock();
 
             // now wait for sender to signal receiver
@@ -178,47 +173,12 @@ pub fn main() !void {
     std.debug.print("Len: {}\n", .{c.len()});
 }
 
-var mut = std.Thread.Mutex{};
-var cond = std.Thread.Condition{};
-var predicate = false;
-fn consumer(i: u8) void {
-    mut.lock(); // don't worry, cond.wait below will unlock it, block until condition signal, and then relock it
-    std.debug.print("consumer {d} locked mutex\n", .{i});
-    defer {
-        mut.unlock(); // so this is a "second" unlock, for the relock on signal
-        std.debug.print("consumer {d} unlocked mutex\n", .{i});
-    }
-    std.debug.print("consumer {d} about to wait\n", .{i});
-    cond.wait(&mut);
-    std.debug.print("consumer {d} wait broken\n", .{i});
-    std.debug.print("consumer {d} after predicate loop\n", .{i});
-}
-fn producer() void {
-    std.time.sleep(1_000_000_000);
-    std.debug.print("producer about to signal\n", .{});
-    cond.signal();
-    std.debug.print("producer signaled\n", .{});
-    std.time.sleep(1_000_000_000);
-    std.debug.print("producer about to signal\n", .{});
-    cond.signal();
-    std.debug.print("producer signaled\n", .{});
-}
-
-test "condition" {
-    std.debug.print("\n", .{});
-
-    const thread1 = try std.Thread.spawn(.{}, consumer, .{1});
-    const thread2 = try std.Thread.spawn(.{}, consumer, .{2});
-    producer();
-    thread1.join();
-    thread2.join();
-}
-
 test "unbufferedChan" {
     std.debug.print("\n", .{});
 
     const T = Chan(u8);
     var chan = T.init(std.testing.allocator);
+    defer chan.deinit();
 
     const thread = struct {
         fn func(c: *T) !void {
