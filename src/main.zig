@@ -11,11 +11,10 @@ fn Chan(comptime T: type) type {
     return BufferedChan(T, 0);
 }
 
-// note: use of buffer not yet implemented
 fn BufferedChan(comptime T: type, comptime bufSize: u8) type {
     return struct {
         const Self = @This();
-        const bufType = [bufSize]?*T; // buffer
+        const bufType = [bufSize]?*T;
         buf: bufType = [_]?*T{null} ** bufSize,
         closed: bool = false,
         mut: std.Thread.Mutex = std.Thread.Mutex{},
@@ -68,6 +67,15 @@ fn BufferedChan(comptime T: type, comptime bufSize: u8) type {
             return self.buf.len;
         }
 
+        fn debugBuf(self: *Self) void {
+            std.debug.print("{d} Buffer debug\n", .{std.time.milliTimestamp()});
+            for (self.buf, 0..) |item, i| {
+                if (item) |unwrapped| {
+                    std.debug.print("[{d}] = {d}\n", .{ i, unwrapped.* });
+                }
+            }
+        }
+
         fn len(self: *Self) u8 {
             var i: u8 = 0;
             for (self.buf) |item| {
@@ -96,14 +104,19 @@ fn BufferedChan(comptime T: type, comptime bufSize: u8) type {
             }
 
             // case: room in buffer
-            if (self.len() < self.capacity()) {
+            const l = self.len();
+            if (l < self.capacity()) {
                 defer self.mut.unlock();
-                // put T on chan buffer
-                // TODO
+
+                // insert into first null spot in buffer
+                var val = try self.alloc.create(T);
+                val.* = data;
+                self.buf[l] = val;
                 return;
             }
 
             // hold on sender queue. Receivers will signal when they take data.
+            // TODO: have it dump into buffer in the case of buffer length shrinking
             var sender = Sender{ .data = data };
 
             // prime condition
@@ -120,14 +133,26 @@ fn BufferedChan(comptime T: type, comptime bufSize: u8) type {
 
         fn recv(self: *Self) ChanError!T {
             if (self.closed) return ChanError.Closed;
-
             self.mut.lock();
             errdefer self.mut.unlock();
 
             // case: value in buffer
-            if (self.len() > 0) {
-                // TODO
-                return ChanError.NotImplemented;
+            const l = self.len();
+            if (l > 0 and bufSize > 0) {
+                defer self.mut.unlock();
+                const val = self.buf[0] orelse return ChanError.DataCorruption;
+                defer self.alloc.destroy(val);
+
+                if (l > 1) {
+                    // shift buffer items up by one
+                    for (self.buf[1..l], 0..l - 1) |item, i| {
+                        self.buf[i] = item;
+                    }
+                }
+
+                self.buf[l - 1] = null;
+
+                return val.*; // copy value out
             }
 
             // case: sender already waiting
@@ -200,4 +225,57 @@ test "unbufferedChan" {
     std.debug.print("{d} Main Received {d}\n", .{ std.time.milliTimestamp(), val });
     val = try chan.recv();
     std.debug.print("{d} Main Received {d}\n", .{ std.time.milliTimestamp(), val });
+}
+
+test "buffered Chan" {
+    std.debug.print("\n", .{});
+
+    const T = BufferedChan(u8, 3);
+    var chan = T.init(std.testing.allocator);
+    defer chan.deinit();
+
+    const thread = struct {
+        fn func(c: *T) !void {
+            std.time.sleep(2_000_000_000);
+            std.debug.print("{d} Thread Receiving\n", .{std.time.milliTimestamp()});
+            var val = try c.recv();
+            std.debug.print("{d} Thread Received {d}\n", .{ std.time.milliTimestamp(), val });
+            std.time.sleep(1_000_000_000);
+            std.debug.print("{d} Thread Receiving\n", .{std.time.milliTimestamp()});
+            val = try c.recv();
+            std.debug.print("{d} Thread Received {d}\n", .{ std.time.milliTimestamp(), val });
+            std.time.sleep(1_000_000_000);
+            std.debug.print("{d} Thread Receiving\n", .{std.time.milliTimestamp()});
+            val = try c.recv();
+            std.debug.print("{d} Thread Received {d}\n", .{ std.time.milliTimestamp(), val });
+            std.time.sleep(1_000_000_000);
+            std.debug.print("{d} Thread Receiving\n", .{std.time.milliTimestamp()});
+            val = try c.recv();
+            std.debug.print("{d} Thread Received {d}\n", .{ std.time.milliTimestamp(), val });
+        }
+    };
+
+    const t = try std.Thread.spawn(.{}, thread.func, .{&chan});
+    defer t.join();
+
+    std.time.sleep(1_000_000_000);
+    var val: u8 = 10;
+    std.debug.print("{d} Main Sending {d}\n", .{ std.time.milliTimestamp(), val });
+    try chan.send(val);
+    std.debug.print("{d} Main Sent {d}\n", .{ std.time.milliTimestamp(), val });
+
+    val = 11;
+    std.debug.print("{d} Main Sending {d}\n", .{ std.time.milliTimestamp(), val });
+    try chan.send(val);
+    std.debug.print("{d} Main Sent {d}\n", .{ std.time.milliTimestamp(), val });
+
+    val = 12;
+    std.debug.print("{d} Main Sending {d}\n", .{ std.time.milliTimestamp(), val });
+    try chan.send(val);
+    std.debug.print("{d} Main Sent {d}\n", .{ std.time.milliTimestamp(), val });
+
+    val = 13;
+    std.debug.print("{d} Main Sending {d}\n", .{ std.time.milliTimestamp(), val });
+    try chan.send(val);
+    std.debug.print("{d} Main Sent {d}\n", .{ std.time.milliTimestamp(), val });
 }
