@@ -116,7 +116,6 @@ fn BufferedChan(comptime T: type, comptime bufSize: u8) type {
             }
 
             // hold on sender queue. Receivers will signal when they take data.
-            // TODO: have it dump into buffer in the case of buffer length shrinking
             var sender = Sender{ .data = data };
 
             // prime condition
@@ -143,14 +142,23 @@ fn BufferedChan(comptime T: type, comptime bufSize: u8) type {
                 const val = self.buf[0] orelse return ChanError.DataCorruption;
                 defer self.alloc.destroy(val);
 
+                // advance items in buffer
                 if (l > 1) {
-                    // shift buffer items up by one
                     for (self.buf[1..l], 0..l - 1) |item, i| {
                         self.buf[i] = item;
                     }
                 }
-
                 self.buf[l - 1] = null;
+
+                // top up buffer with a waiting sender, if any
+                if (self.sendQ.items.len > 0) {
+                    var sender: *Sender = self.sendQ.orderedRemove(0);
+                    const valFromSender: T = sender.getDataAndSignal();
+
+                    var valForBuf = try self.alloc.create(T);
+                    valForBuf.* = valFromSender;
+                    self.buf[l - 1] = valForBuf;
+                }
 
                 return val.*; // copy value out
             }
