@@ -105,7 +105,7 @@ fn BufferedChan(comptime T: type, comptime bufSize: u8) type {
 
             // case: room in buffer
             const l = self.len();
-            if (l < self.capacity()) {
+            if (l < self.capacity() and bufSize > 0) {
                 defer self.mut.unlock();
 
                 // insert into first null spot in buffer
@@ -278,4 +278,40 @@ test "buffered Chan" {
     std.debug.print("{d} Main Sending {d}\n", .{ std.time.milliTimestamp(), val });
     try chan.send(val);
     std.debug.print("{d} Main Sent {d}\n", .{ std.time.milliTimestamp(), val });
+}
+
+test "chan of chan" {
+    std.debug.print("\n", .{});
+
+    const T = BufferedChan(u8, 3);
+    const TofT = Chan(T);
+
+    var chanOfChan = TofT.init(std.testing.allocator);
+
+    defer chanOfChan.deinit();
+
+    const thread = struct {
+        fn func(cOC: *TofT) !void {
+            std.time.sleep(2_000_000_000);
+            std.debug.print("{d} Thread Receiving\n", .{std.time.milliTimestamp()});
+            var c = try cOC.recv();
+            std.debug.print("{d} Thread Received chan of chan: {any}\n", .{ std.time.milliTimestamp(), cOC });
+            std.debug.print("{d} Thread pulling from chan buffer\n", .{std.time.milliTimestamp()});
+            var val = try c.recv(); // should have value on buffer
+            std.debug.print("{d} Thread received from chan: {d}\n", .{ std.time.milliTimestamp(), val });
+        }
+    };
+
+    const t = try std.Thread.spawn(.{}, thread.func, .{&chanOfChan});
+    defer t.join();
+
+    std.time.sleep(1_000_000_000);
+    var val: u8 = 10;
+    var chan = T.init(std.testing.allocator);
+    defer chan.deinit();
+    std.debug.print("{d} Main sending u8 to chan {d}\n", .{ std.time.milliTimestamp(), val });
+    try chan.send(val);
+
+    std.debug.print("{d} Main sending chan across chanOfChan\n", .{std.time.milliTimestamp()});
+    try chanOfChan.send(chan);
 }
