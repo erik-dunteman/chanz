@@ -200,7 +200,32 @@ pub fn main() !void {
     std.debug.print("Len: {}\n", .{c.len()});
 }
 
+
 test "unbufferedChan" {
+    // create channel of u8 
+    const T = Chan(u8);
+    var chan = T.init(std.testing.allocator);
+    defer chan.deinit();
+
+    // spawn thread that immediately waits on channel
+    const thread = struct {
+        fn func(c: *T) !void {
+            const val = try c.recv();
+            std.debug.print("{d} Thread Received {d}\n", .{ std.time.milliTimestamp(), val });
+        }
+    };
+    const t = try std.Thread.spawn(.{}, thread.func, .{&chan});
+    defer t.join();
+
+    // let thread wait a bit before sending value
+    std.time.sleep(1_000_000_000);
+
+    var val: u8 = 10;
+    std.debug.print("{d} Main Sending {d}\n", .{ std.time.milliTimestamp(), val });
+    try chan.send(val);
+}
+
+test "bidirectional unbufferedChan" {
     std.debug.print("\n", .{});
 
     const T = Chan(u8);
@@ -293,9 +318,7 @@ test "chan of chan" {
 
     const T = BufferedChan(u8, 3);
     const TofT = Chan(T);
-
     var chanOfChan = TofT.init(std.testing.allocator);
-
     defer chanOfChan.deinit();
 
     const thread = struct {
