@@ -14,8 +14,8 @@ fn Chan(comptime T: type) type {
 fn BufferedChan(comptime T: type, comptime bufSize: u8) type {
     return struct {
         const Self = @This();
-        const bufType = [bufSize]?*T;
-        buf: bufType = [_]?*T{null} ** bufSize,
+        const bufType = [bufSize]?T;
+        buf: bufType = [_]?T{null} ** bufSize,
         closed: bool = false,
         mut: std.Thread.Mutex = std.Thread.Mutex{},
         alloc: std.mem.Allocator = undefined,
@@ -71,7 +71,7 @@ fn BufferedChan(comptime T: type, comptime bufSize: u8) type {
             std.debug.print("{d} Buffer debug\n", .{std.time.milliTimestamp()});
             for (self.buf, 0..) |item, i| {
                 if (item) |unwrapped| {
-                    std.debug.print("[{d}] = {d}\n", .{ i, unwrapped.* });
+                    std.debug.print("[{d}] = {d}\n", .{ i, unwrapped });
                 }
             }
         }
@@ -109,9 +109,7 @@ fn BufferedChan(comptime T: type, comptime bufSize: u8) type {
                 defer self.mut.unlock();
 
                 // insert into first null spot in buffer
-                var val = try self.alloc.create(T);
-                val.* = data;
-                self.buf[l] = val;
+                self.buf[l] = data;
                 return;
             }
 
@@ -140,7 +138,6 @@ fn BufferedChan(comptime T: type, comptime bufSize: u8) type {
             if (l > 0 and bufSize > 0) {
                 defer self.mut.unlock();
                 const val = self.buf[0] orelse return ChanError.DataCorruption;
-                defer self.alloc.destroy(val);
 
                 // advance items in buffer
                 if (l > 1) {
@@ -154,13 +151,10 @@ fn BufferedChan(comptime T: type, comptime bufSize: u8) type {
                 if (self.sendQ.items.len > 0) {
                     var sender: *Sender = self.sendQ.orderedRemove(0);
                     const valFromSender: T = sender.getDataAndSignal();
-
-                    var valForBuf = try self.alloc.create(T);
-                    valForBuf.* = valFromSender;
-                    self.buf[l - 1] = valForBuf;
+                    self.buf[l - 1] = valFromSender;
                 }
 
-                return val.*; // copy value out
+                return val;
             }
 
             // case: sender already waiting
@@ -200,9 +194,8 @@ pub fn main() !void {
     std.debug.print("Len: {}\n", .{c.len()});
 }
 
-
 test "unbufferedChan" {
-    // create channel of u8 
+    // create channel of u8
     const T = Chan(u8);
     var chan = T.init(std.testing.allocator);
     defer chan.deinit();
